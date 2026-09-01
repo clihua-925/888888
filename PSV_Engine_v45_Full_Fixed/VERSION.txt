@@ -1,0 +1,32 @@
+PSV Engine v44.0 - Refactored Release
+=====================================
+重构日期: 2026-09-01
+
+重构内容:
+1. [架构重构] core/memory/db.py - 统一实体架构(entity_id)
+   - 新增 entities 统一权威实体表
+   - 新增 entity_lifecycle 生命周期历史表
+   - 新增 evidence_registry 统一证据注册表
+   - account_intelligence/trade_intelligence/contact_intelligence 改为实体扩展表
+2. [品类隔离] 所有后半程表增加 category_id 字段
+   - 支持蜡烛/珐琅锅/毛毡三品类严格隔离
+   - 同一企业多品类通过 category_id 区分，不复制实体
+3. [生命周期] 新增 transition_lifecycle() 方法
+   - 完整状态流: DISCOVERED -> TRADE_CONFIRMED -> ENRICHING -> ENRICHED -> CONTACT_FOUND -> CONTACT_VERIFIED -> QUALIFIED -> READY_FOR_OUTREACH -> OUTREACH_ACTIVE -> REPLIED -> FOLLOW_UP -> OPPORTUNITY -> CUSTOMER
+   - 支持 QUARANTINED/INVALID/NO_SIGNAL/DO_NOT_CONTACT 异常状态
+4. [证据体系] 新增 save_evidence()/list_evidence()
+   - source_type 严格区分: trade_evidence | web_scrape | ai_inference | contact_info
+   - 每条证据记录 confidence/discovered_at/verified_at
+5. [代码清理] 删除 core/tools/expand.py（功能由 network_expansion.py 覆盖）
+6. [代码清理] 删除 core/tools/customs_graph.py（功能由 trade_graph/ 覆盖）
+7. [数据迁移] 新增 _migrate_v43_to_v44() 自动迁移旧数据
+8. [第一采集链] 100%冻结，未做任何修改
+
+架构原则:
+- 一个实体 = 一个 entity_id + 多个角色/关系/证据/品类关联
+- 情报中心/贸易图谱/业务中心共享统一 entities 表
+- 禁止同一公司三个模块各存一份数据
+
+启动方式:
+  python run_webui.py
+  浏览器打开 http://localhost:8090
