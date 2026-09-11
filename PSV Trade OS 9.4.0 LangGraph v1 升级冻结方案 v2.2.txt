@@ -1,0 +1,379 @@
+# PSV Trade OS 9.4.0 LangGraph v1 升级冻结方案 v2.2
+
+**文档状态**：冻结基线（不可修改，只可作为评审依据）
+**适用范围**：PSV Trade OS 9.4.0 从 LangGraph 0.6.x 升级到 v1.2.x 的全部阶段
+**评审规则**：任何阶段 PASS/FAIL 均以本文档的门槛为准，方案本身禁止被修改
+
+---
+
+## 一、冻结架构边界（任何阶段禁止修改）
+
+| 项 | 内容 |
+|---|---|
+| 五层架构 | WebUI/API → Orchestration Agent → Business → Contract/Runtime/State → Infrastructure |
+| 业务节点 | 固定 9 个：PRODUCT_DEFINITION / TRADE_STRATEGY / CUSTOMS_NODE_COLLECTION / TRADE_EDGE_BUILD / EVIDENCE_VERIFY / ENTITY_RESOLUTION / GRAPH_EXPANSION / RESOURCE_CLASSIFICATION / DATABASE_COMMIT |
+| 业务节点禁止 | 路由、retry、timeout、调度、恢复、checkpoint 生命周期 |
+| 唯一路由 | Condition Edge Engine（core/orchestration/conditions.py） |
+| 恢复机制 | RecoveryManager 通用化，禁止硬编码业务节点 ID |
+| Runtime 依赖传递 | contextvars（core/orchestration/runtime.py），禁止写入 state["orchestration"] |
+| 数据库写入 | 只有 DATABASE_COMMIT 一处，通过注入的 Database |
+| AI 调用 | DecisionLayer + ReasoningEngine，JSON Schema 输出，禁止 Function Calling / Tool Calling |
+| LangGraph checkpoint | SqliteSaver，路径 data/checkpoints.db |
+
+### Shared State 冻结（16 字段）
+
+**12 个核心业务字段**：
+- mission
+- product_definition
+- trade_nodes
+- fragments
+- evidence_pool
+- entities
+- relationships
+- decisions
+- history
+- orchestration
+- error
+- node_reports
+
+**4 个 envelope 字段**：
+- status
+- task_id
+- workflow_id
+- workflow_version
+
+**禁止**：新增、删除、改名、修改类型。
+
+---
+
+## 二、依赖冻结
+
+### 开发验证范围
+
+```
+langgraph>=1.2,<1.3
+langgraph-checkpoint>=4.1,<5
+langgraph-checkpoint-sqlite>=3.1,<4
+```
+
+### 发布冻结版本
+
+```
+langgraph==1.2.11
+langgraph-checkpoint==4.1.1
+langgraph-checkpoint-sqlite==3.1.1
+```
+
+### 禁止显式写入 requirements.txt
+
+- langchain-core（由 langgraph 传递依赖）
+- langgraph-prebuilt（由 langgraph 传递依赖）
+- langgraph-sdk（由 langgraph 传递依赖）
+
+### 禁止出现在环境里
+
+- langchain（与 langchain-core 1.x 冲突）
+- langchain-openai（与 langchain-core 1.x 冲突）
+
+---
+
+## 三、LangGraph API 冻结
+
+### StateGraph 构造
+
+```python
+graph = StateGraph(state_schema=TaskState)
+```
+
+### Conditional Edge
+
+router 返回值 = node_id 或 END
+
+mapping：
+
+```python
+targets = {node_id: node_id for node_id in plan.order}
+targets[END] = END
+```
+
+### SqliteSaver 导入
+
+```python
+from langgraph.checkpoint.sqlite import SqliteSaver
+```
+
+### invoke
+
+```python
+graph.invoke(state, config)
+```
+
+---
+
+## 四、阶段划分与门槛
+
+### Stage 0 — LangGraph API 适配
+
+**状态**：PASS（已冻结）
+
+**门槛**：
+- [x] requirements.txt 中 langgraph 三包版本符合冻结范围
+- [x] engine.py 使用 `StateGraph(state_schema=TaskState)`
+- [x] Conditional Edge mapping 格式正确
+- [x] SqliteSaver 导入路径正确
+- [x] upgrade_langgraph.ps1 存在且使用完整 Python 路径
+- [x] rollback_langgraph.ps1 存在
+- [x] 禁止文件（business/**, conditions.py, recovery.py, state.py, runtime.py, scheduler.py）未修改
+
+---
+
+### Stage 1a — PyPI 版本真实性验证
+
+**状态**：PASS（已冻结）
+
+**门槛**：
+- [x] `pip index versions langgraph` 显示 1.2.x 存在
+- [x] `pip index versions langgraph-checkpoint` 显示 4.1.x 存在
+- [x] `pip index versions langgraph-checkpoint-sqlite` 显示 3.1.x 存在
+
+---
+
+### Stage 1b — 依赖升级 + 三重门槛
+
+**状态**：HOLD
+
+**门槛**（三条必须同时满足）：
+
+1. **版本确认**
+   ```
+   pip list | Select-String "langgraph|langchain-core"
+   ```
+   必须包含：
+   - langgraph 1.2.11
+   - langgraph-checkpoint 4.1.1
+   - langgraph-checkpoint-sqlite 3.1.1
+   - langchain-core >= 1.4.7
+
+2. **验收测试**
+   ```
+   D:\chang\venv\Scripts\python.exe -m pytest tests/test_acceptance.py -v
+   ```
+   必须：23 passed
+
+3. **Runtime Gate**
+   ```
+   D:\chang\venv\Scripts\python.exe verify_install.py --runtime
+   ```
+   必须：RUNTIME_OK
+
+**当前卡点**：
+- 门槛 1 PASS
+- 门槛 2 PASS（23 passed）
+- 门槛 3 FAIL
+
+失败详情：
+- 9 个业务节点全部执行成功
+- DATABASE_COMMIT 成功写入数据（event 59: entity_count=2, evidence_count=4, relationship_count=2）
+- DATABASE_COMMIT 完成后（15:36:08）无事件，直到 15:40:56 TASK_TIMEOUT
+- 错误：Task exceeded 1721 seconds
+
+**根因假设（待验证）**：
+- A：LangGraph v1 + SqliteSaver 在最后 checkpoint 后不退出
+- B：multiprocessing.spawn 子进程生命周期问题
+- C：contextvars 或 engine 资源未释放
+
+**修复约束**：
+- 不允许修改业务节点
+- 不允许修改 conditions.py / recovery.py / state.py / runtime.py / scheduler.py
+- 只允许修改 core/orchestration/engine.py 或验证方式
+- 修复前必须先做最小复现验证，禁止直接改代码
+
+---
+
+### Stage 2 — Checkpoint 数据库验证
+
+**门槛**：
+
+1. 删除旧 `data/checkpoints.db`
+2. 运行一次任务
+3. 用 Python 内置 sqlite3 检查：
+   ```
+   D:\chang\venv\Scripts\python.exe -c "
+   import sqlite3
+   conn = sqlite3.connect('data/checkpoints.db')
+   tables = [r[0] for r in conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")]
+   print('tables:', tables)
+   for t in tables:
+       count = conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+       print(f'  {t}: {count} rows')
+   conn.close()
+   "
+   ```
+4. 必须同时满足：
+   - `checkpoints` 表存在且行数 > 0
+   - `writes` 表存在且行数 > 0
+
+---
+
+### Stage 3 — 真实任务端到端验证
+
+**门槛**：
+
+1. `verify_install.py --runtime` 输出 RUNTIME_OK
+2. SQLite 三张表有数据：
+   ```
+   D:\chang\venv\Scripts\python.exe -c "
+   import sqlite3
+   conn = sqlite3.connect('data/psv.db')
+   for t in ['trade_entities', 'trade_edges', 'evidence']:
+       count = conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+       print(f'{t}: {count}')
+   conn.close()
+   "
+   ```
+3. 必须三张表行数均 > 0
+
+---
+
+### Stage 4 — Scheduler 恢复机制复验
+
+**门槛**：
+
+1. 运行：
+   ```
+   D:\chang\venv\Scripts\python.exe -m pytest tests/test_acceptance.py::test_scheduler_recovers_pending_and_marks_interrupted_running -v
+   ```
+2. 必须 PASS
+3. 无新的 Scheduler 问题
+
+---
+
+### Stage 5 — 发布包整理
+
+**门槛**：
+
+1. 无以下文件：
+   - `__pycache__` 目录
+   - `*.pyc` / `*.tmp` / `*.bak` / `*.swp`
+   - `.venv`
+   - `data/*.db`
+   - `upgrade_before_versions.txt`
+   - `upgrade_before_versions.txt.backup`
+2. `PROJECT_SOURCE_MANIFEST.txt` 中 `File count:` 与实际部署文件数一致
+3. ZIP 提供 SHA256
+
+---
+
+### Stage 6 — 冻结签署
+
+**门槛**：
+
+全部上述 Stage 通过，且签署清单全部勾选：
+
+- [ ] langgraph==1.2.11
+- [ ] langgraph-checkpoint==4.1.1
+- [ ] langgraph-checkpoint-sqlite==3.1.1
+- [ ] langchain-core >= 1.4.7
+- [ ] pytest 23 passed
+- [ ] verify_install.py --runtime = RUNTIME_OK
+- [ ] checkpoints 表存在且行数 > 0
+- [ ] writes 表存在且行数 > 0
+- [ ] trade_entities 有数据
+- [ ] trade_edges 有数据
+- [ ] evidence 有数据
+- [ ] 9 业务节点未修改
+- [ ] Condition Edge 未修改
+- [ ] RecoveryManager 未修改
+- [ ] Shared State 16 字段不变
+- [ ] DATABASE_COMMIT 唯一写入口
+- [ ] 无 Function Calling / Tool Calling
+- [ ] 无瞬态文件
+- [ ] Manifest 一致
+
+---
+
+## 五、执行规则（硬性）
+
+1. **严格串行**：Stage N PASS 才能进入 Stage N+1
+2. **每阶段自审**：逐条对照门槛，输出证据（命令 + 输出摘要），不许"应该通过"
+3. **每阶段 ZIP**：PASS 后生成累积 ZIP + SHA256
+4. **禁止跨阶段**：Stage N FAIL 时停留当前阶段修复，不许跳跃
+5. **禁止修改方案**：方案有缺陷时先报告，不能自行修改
+6. **禁止动业务层**：
+   - business/**
+   - core/orchestration/state.py
+   - core/orchestration/conditions.py
+   - core/orchestration/recovery.py
+   - core/orchestration/runtime.py
+   - core/orchestration/scheduler.py
+   - core/orchestration/mission.py
+   - core/orchestration/decision.py
+   - core/model/reasoning.py
+7. **所有 PowerShell 命令用完整路径**：`D:\chang\venv\Scripts\python.exe`
+8. **禁止修改 tests/test_acceptance.py 断言来"绕过"失败**（可以修 Manifest 相关的排除列表，但不能改断言值）
+
+---
+
+## 六、已经修好的内容（不要再重做）
+
+### Stage 1b 修复项（已完成）
+
+**requirements.txt**：
+- 删除 `langchain==0.3.30`
+- 删除 `langchain-openai==0.3.35`
+- 不显式写 langchain-core
+- 保留 langgraph 三件套
+
+**verify_install.py**：
+- packages 字典改为：
+  ```python
+  packages = {
+      "langgraph": "langgraph",
+      "langgraph-checkpoint": "langgraph-checkpoint",
+      "langgraph-checkpoint-sqlite": "langgraph-checkpoint-sqlite",
+      "langchain-core": "langchain-core",
+  }
+  ```
+- 使用 `importlib.metadata.version(dist_name)` 而不是 `import_module`
+- 读取文本文件用 `encoding="utf-8-sig"`
+
+**tests/test_acceptance.py**：
+- `generated_files` 加入 `upgrade_before_versions.txt` 和 `upgrade_before_versions.txt.backup`
+
+**upgrade_langgraph.ps1 / rollback_langgraph.ps1**：
+- 使用完整 Python 路径
+- 用 `Out-File -Encoding utf8` 代替 `>`
+- rollback 优先从 `upgrade_before_versions.txt` 读取
+
+---
+
+## 七、当前进度台账
+
+| 阶段 | 状态 | 上一阶段完成 | 下一阶段启动条件 |
+|---|---|---|---|
+| Stage 0 | PASS | - | 已完成 |
+| Stage 1a | PASS | Stage 0 | 已完成 |
+| Stage 1b | HOLD | Stage 1a | DATABASE_COMMIT 后进程不退出问题修复 |
+| Stage 2 | 未启动 | - | Stage 1b PASS |
+| Stage 3 | 未启动 | - | Stage 2 PASS |
+| Stage 4 | 未启动 | - | Stage 3 PASS |
+| Stage 5 | 未启动 | - | Stage 4 PASS |
+| Stage 6 | 未启动 | - | Stage 5 PASS |
+
+---
+
+## 八、环境信息
+
+- Python 3.12.10
+- Windows PowerShell
+- 项目目录：D:\chang\PSV_Trade_OS_9.4.0_Stage1b_FIX_v3
+- venv 路径：D:\chang\venv
+- LLM：http://192.168.1.26:8081/v1（llama.cpp，DeepSeek-R1-Distill-Llama-70B）
+
+---
+
+## 九、评审依据
+
+本文档是唯一评审依据。任何阶段 PASS/FAIL 判定必须逐条对照本文档门槛，输出证据。
+
+如果方案本身有缺陷，必须在当前阶段先报告缺陷，禁止自行修改方案继续执行。
